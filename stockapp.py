@@ -1,294 +1,266 @@
-# stockapp.py — VN / International market restored, vnstock → yfinance fallback,
-# P/L fixed, prediction progress text added
+# stock_prediction_app.py
+# VNStock primary → yfinance fallback
+# Market selector restored
+# P/L table fixed
+# Spinner + status text added
+# User input (shares) placed at top
 
 import streamlit as st
-import pandas as pd
 import numpy as np
-import datetime
+import pandas as pd
+from datetime import date, timedelta
 
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LogisticRegression
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score
 
-import plotly.express as px
+from xgboost import XGBClassifier
+import yfinance as yf
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 
-# ===============================
-# Optional vnstock (VN market)
-# ===============================
+# =============================
+# Optional vnstock
+# =============================
 try:
-    from vnstock import Quote
+    from vnstock import Vnstock
     vnstock_ok = True
 except Exception:
     vnstock_ok = False
 
-# ===============================
-# yfinance (fallback / intl)
-# ===============================
-import yfinance as yf
+# =============================
+# App config
+# =============================
+st.set_page_config(page_title="📈 Stock ML Predictor", layout="wide")
+st.title("📊 Stock Market Prediction Dashboard")
 
+# =============================
+# USER INPUT (TOP)
+# =============================
+col1, col2, col3 = st.columns(3)
 
-# ===============================
-# Streamlit config
-# ===============================
-st.set_page_config(page_title="Unsupervised Stock Explorer", layout="wide")
-st.title("📊 Unsupervised Stock Behavior Explorer")
+with col1:
+    market = st.selectbox("Market", ["VN (Việt Nam)", "INTL (International)"])
 
+with col2:
+    ticker = st.text_input("Stock Code", "AAPL").upper().strip()
 
-# ===============================
-# Indicators
-# ===============================
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0).rolling(period).mean()
-    loss = -delta.clip(upper=0).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+with col3:
+    shares = st.number_input("Number of shares", min_value=1, value=100)
 
+months_back = st.slider("Months of Data", 3, 24, 6)
+indicator = st.selectbox("Indicator Type", ["SMA", "EMA"])
 
-# ===============================
-# Normalize dataframe
-# ===============================
-def unify_df(df):
-    if df is None or df.empty:
-        return None
+run_btn = st.button("🚀 Run Prediction")
 
-    df = df.copy()
+if "trained" not in st.session_state:
+    st.session_state.trained = False
 
-    if "time" in df.columns:
-        df["time"] = pd.to_datetime(df["time"])
-        df = df.set_index("time")
-    else:
-        df.index = pd.to_datetime(df.index)
-
-    rename_map = {
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close",
-        "volume": "Volume",
-    }
-    df = df.rename(columns=rename_map)
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(c in df.columns for c in required):
-        return None
-
-    df["Returns"] = df["Close"].pct_change()
-    df["Volatility"] = df["Returns"].rolling(7).std()
-    df["SMA10"] = df["Close"].rolling(10).mean()
-    df["SMA20"] = df["Close"].rolling(20).mean()
-    df["RSI"] = compute_rsi(df["Close"])
-
-    df = df.dropna()
-    return df if not df.empty else None
-
-
-# ===============================
-# Data loaders
-# ===============================
+# =============================
+# Helpers
+# =============================
 def load_vnstock(ticker, start, end):
     if not vnstock_ok:
-        return None
+        return None, None
 
-    try:
-        quote = Quote(symbol=ticker, source="VCI")
-        df = quote.history(
-            start=start.strftime("%Y-%m-%d"),
-            end=end.strftime("%Y-%m-%d"),
-            interval="1D",
-        )
-        return unify_df(df)
-    except Exception:
-        return None
+    sources = ["VCI", "FPT", "SSI", "VCBS"]
+    for src in sources:
+        try:
+            stock = Vnstock().stock(symbol=ticker, source=src)
+            df = stock.quote.history(
+                start=str(start),
+                end=str(end),
+            )
+            if df is not None and not df.empty:
+                return df, f"vnstock-{src}"
+        except Exception:
+            continue
+    return None, None
 
 
-def load_yfinance(ticker, start, end):
+def load_yf(ticker, start, end):
     try:
         df = yf.download(ticker, start=start, end=end, progress=False)
-        return unify_df(df)
+        return df
     except Exception:
         return None
 
 
-# ===============================
-# Feature matrix
-# ===============================
-def make_feature_matrix(data):
-    rows = []
-    for t, df in data.items():
-        rows.append({
-            "Ticker": t,
-            "AvgReturn": df["Returns"].mean(),
-            "Volatility": df["Volatility"].mean(),
-            "RSI": df["RSI"].mean(),
-            "SMA10_Slope": df["SMA10"].iloc[-1] - df["SMA10"].iloc[0],
-            "SMA20_Slope": df["SMA20"].iloc[-1] - df["SMA20"].iloc[0],
-        })
-    return pd.DataFrame(rows)
-
-
-# ===============================
-# Sidebar / Inputs
-# ===============================
-st.subheader("🔧 Inputs")
-
-market = st.selectbox("Market", ["VN", "International"])
-
-raw_tickers = st.text_input("Tickers (comma separated)", "VNM, HPG, FPT")
-tickers = [t.strip().upper() for t in raw_tickers.split(",") if t.strip()]
-
-shares = st.number_input("Shares per stock", min_value=1, value=100)
-
-months = st.slider("Months of history", 3, 36, 12)
-
-run_btn = st.button("▶ Run prediction")
-
-
-# ===============================
-# Main logic
-# ===============================
+# =============================
+# RUN
+# =============================
 if run_btn:
-    with st.spinner("🔮 Predicting stock behavior..."):
-        end = datetime.datetime.now()
-        start = end - datetime.timedelta(days=months * 30)
+    with st.spinner("🔮 Predicting... Please wait"):
+        start_date = date.today() - timedelta(days=months_back * 30)
+        end_date = date.today()
 
-        stock_data = {}
+        df, src = None, None
 
-        for t in tickers:
-            df = None
+        # ---- VN primary → yfinance fallback
+        if "VN" in market:
+            df, src = load_vnstock(ticker, start_date, end_date)
+            if df is None:
+                df = load_yf(f"{ticker}.VN", start_date, end_date)
+                src = "yfinance"
+        else:
+            df = load_yf(ticker, start_date, end_date)
+            src = "yfinance"
 
-            if market == "VN":
-                df = load_vnstock(t, start, end)
-                if df is None:
-                    df = load_yfinance(f"{t}.VN", start, end)
-
-            else:
-                df = load_yfinance(t, start, end)
-
-            if df is not None:
-                stock_data[t] = df
-
-        if len(stock_data) < 2:
-            st.error("Need at least 2 valid stocks")
+        if df is None or df.empty:
+            st.error("❌ Unable to load data")
             st.stop()
 
-        # ===============================
-        # Feature engineering
-        # ===============================
-        features = make_feature_matrix(stock_data)
+        df = df.copy()
+        df.rename(columns=lambda x: x.title(), inplace=True)
 
-        X = features.drop(columns=["Ticker"])
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
+        st.success(f"✅ Data loaded from {src}")
+
+        # =============================
+        # Indicators
+        # =============================
+        if indicator == "EMA":
+            df["Fast"] = df["Close"].ewm(span=5).mean()
+            df["Slow"] = df["Close"].ewm(span=20).mean()
+        else:
+            df["Fast"] = df["Close"].rolling(5).mean()
+            df["Slow"] = df["Close"].rolling(20).mean()
+
+        df["Diff"] = df["Fast"] - df["Slow"]
+
+        # Target: binary (FIXES CLASS ERROR)
+        df["Target"] = np.where(df["Diff"] > 0, 1, 0)
+
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        df["RSI"] = 100 - (100 / (1 + gain.rolling(14).mean() / loss.rolling(14).mean()))
+
+        ema12 = df["Close"].ewm(span=12).mean()
+        ema26 = df["Close"].ewm(span=26).mean()
+        df["MACD"] = ema12 - ema26
+
+        mid = df["Close"].rolling(20).mean()
+        std = df["Close"].rolling(20).std()
+        df["BB_Width"] = (mid + 2 * std) - (mid - 2 * std)
+
+        df.dropna(inplace=True)
+
+        features = ["Diff", "Volume", "RSI", "MACD", "BB_Width"]
+        X = df[features]
+        y = df["Target"]
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.25, random_state=42, stratify=y
+        )
+
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
 
-        # ===============================
-        # Clustering
-        # ===============================
-        k = min(4, len(features))
-        kmeans = KMeans(n_clusters=k, n_init="auto")
-        features["Cluster"] = kmeans.fit_predict(X_scaled)
-
-        # ===============================
-        # PCA
-        # ===============================
-        pca = PCA(n_components=2)
-        pcs = pca.fit_transform(X_scaled)
-        features["PC1"] = pcs[:, 0]
-        features["PC2"] = pcs[:, 1]
-
-        st.subheader("🧮 Feature Matrix")
-        st.dataframe(features)
-
-        fig = px.scatter(
-            features,
-            x="PC1",
-            y="PC2",
-            color=features["Cluster"].astype(str),
-            text="Ticker",
-            size="Volatility",
-            title="PCA Clustering",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # ===============================
-        # Anomaly detection
-        # ===============================
-        iso = IsolationForest(contamination=0.1)
-        features["Anomaly"] = iso.fit_predict(X_scaled)
-
-        st.subheader("⚠️ Anomalies")
-        st.dataframe(features[features["Anomaly"] == -1])
-
-        # ===============================
-        # Profit / Loss estimation
-        # ===============================
-        st.subheader("💰 Profit / Loss Estimation")
-
-        pl_rows = []
-
-        for t, df in stock_data.items():
-            last_price = df["Close"].iloc[-1]
-            daily_std = df["Returns"].std()
-
-            invested = last_price * shares
-
-            best = invested * (1 + 2 * daily_std)
-            worst = invested * (1 - 2 * daily_std)
-            expected = invested * (1 + df["Returns"].mean())
-
-            pl_rows.append({
-                "Ticker": t,
-                "Invested": round(invested, 2),
-                "Best case": round(best - invested, 2),
-                "Worst case": round(worst - invested, 2),
-                "Expected (mean)": round(expected - invested, 2),
-            })
-
-        pl_df = pd.DataFrame(pl_rows)
-        st.dataframe(pl_df)
-
-        # ===============================
-        # Price viewer
-        # ===============================
-        st.subheader("📈 Price Viewer")
-
-        choice = st.selectbox("Select ticker", list(stock_data.keys()))
-        dfv = stock_data[choice]
-
-        fig2 = make_subplots(
-            rows=2,
-            cols=1,
-            shared_xaxes=True,
-            row_heights=[0.7, 0.3],
-            vertical_spacing=0.03,
-            specs=[[{"type": "candlestick"}], [{"type": "bar"}]],
-        )
-
-        fig2.add_trace(
-            go.Candlestick(
-                x=dfv.index,
-                open=dfv["Open"],
-                high=dfv["High"],
-                low=dfv["Low"],
-                close=dfv["Close"],
-                name="Price",
+        models = {
+            "Logistic Regression": LogisticRegression(max_iter=1000),
+            "KNN": KNeighborsClassifier(5),
+            "Decision Tree": DecisionTreeClassifier(max_depth=5),
+            "Random Forest": RandomForestClassifier(100),
+            "XGBoost": XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                use_label_encoder=False,
             ),
-            row=1,
-            col=1,
-        )
+        }
 
-        fig2.add_trace(go.Scatter(x=dfv.index, y=dfv["SMA10"], name="SMA10"), row=1, col=1)
-        fig2.add_trace(go.Scatter(x=dfv.index, y=dfv["SMA20"], name="SMA20"), row=1, col=1)
+        results = []
+        trained = {}
 
-        fig2.add_trace(
-            go.Bar(x=dfv.index, y=dfv["Volume"], name="Volume"),
-            row=2,
-            col=1,
-        )
+        for name, m in models.items():
+            try:
+                m.fit(X_train_s, y_train)
+                pred = m.predict(X_test_s)
+                results.append([
+                    name,
+                    accuracy_score(y_test, pred),
+                    f1_score(y_test, pred),
+                ])
+                trained[name] = m
+            except Exception:
+                continue
 
-        st.plotly_chart(fig2, use_container_width=True)
+        results_df = pd.DataFrame(
+            results, columns=["Model", "Accuracy", "F1 Score"]
+        ).sort_values("F1 Score", ascending=False)
 
-    st.success("✔ Prediction completed")
+        st.subheader("🧠 Model Performance")
+        st.dataframe(results_df, use_container_width=True)
+
+        st.session_state.update({
+            "trained": True,
+            "df": df,
+            "X": X,
+            "scaler": scaler,
+            "models": trained,
+            "results": results_df,
+            "ticker": ticker,
+            "shares": shares,
+        })
+
+    st.success("✔ Prediction finished")
+
+# =============================
+# PREDICTION + P/L
+# =============================
+if st.session_state.trained:
+    st.subheader("📈 Final Prediction")
+
+    model_name = st.selectbox(
+        "Choose model",
+        st.session_state.results["Model"].tolist(),
+    )
+    model = st.session_state.models[model_name]
+
+    last_row = st.session_state.X.iloc[-1].values.reshape(1, -1)
+    last_scaled = st.session_state.scaler.transform(last_row)
+
+    prob_up = (
+        model.predict_proba(last_scaled)[0][1]
+        if hasattr(model, "predict_proba")
+        else float(model.predict(last_scaled)[0])
+    )
+
+    last_price = float(st.session_state.df["Close"].iloc[-1])
+    shares = st.session_state.shares
+
+    expected_change = (prob_up * 0.02) - ((1 - prob_up) * 0.02)
+    expected_price = last_price * (1 + expected_change)
+
+    pl_expected = (expected_price - last_price) * shares
+    pl_best = (last_price * 1.02 - last_price) * shares
+    pl_worst = (last_price * 0.98 - last_price) * shares
+
+    st.metric("Probability of UP", f"{prob_up*100:.2f}%")
+
+    pl_df = pd.DataFrame({
+        "Scenario": ["Probability-weighted", "Best case", "Worst case"],
+        "P / L": [
+            round(pl_expected, 2),
+            round(pl_best, 2),
+            round(pl_worst, 2),
+        ],
+    })
+
+    st.subheader("💰 Profit / Loss")
+    st.dataframe(pl_df, use_container_width=True)
+
+    st.subheader("📊 Price Chart")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=st.session_state.df.index,
+        y=st.session_state.df["Close"],
+        name="Close",
+    ))
+    st.plotly_chart(fig, use_container_width=True)
